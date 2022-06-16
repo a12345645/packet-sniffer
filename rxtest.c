@@ -13,6 +13,9 @@
 #include <sys/poll.h>
 #include <unistd.h>
 
+#include <netinet/ip.h>
+#include <arpa/inet.h>
+
 typedef struct _rxring *rxring_t;
 typedef int (*rx_cb_t)(void *u, const uint8_t *buf, size_t len);
 
@@ -36,7 +39,8 @@ struct _rxring {
 /* 1. Open the packet socket */
 static bool packet_socket(rxring_t rx)
 {
-    return (rx->fd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL))) >= 0;
+    
+    return (rx->fd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_IP))) >= 0;
 }
 
 /* 2. Set TPACKET_V3 */
@@ -71,6 +75,29 @@ static bool rx_ring(rxring_t rx)
 /* 4. Bind to the ifindex on our sending interface */
 static bool bind_if(rxring_t rx, const char *ifname)
 {
+    int err;
+    /* get interface number on which we want to capture the traffic
+     * if_nametoindex defined in net/if.h  */
+    int interface_number = if_nametoindex(ifname);
+    if(interface_number == 0){
+        fprintf(stderr, "Can't get interface number for interface %s\n", ifname);
+        return -1;
+    }
+
+    /* setting interface to promiscous mode. Promiscous mode
+     * passes all traffic to kernel. packet_mreq defined in linux/if_packet.h */
+    struct packet_mreq sock_params;
+    memset(&sock_params, 0, sizeof(sock_params));
+    sock_params.mr_type = PACKET_MR_PROMISC;
+    sock_params.mr_ifindex = interface_number;
+    err = setsockopt(rx->fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP,
+            (void*)&sock_params, sizeof(sock_params));
+    if(err){
+        fprintf(stderr, "coud not set socket in promiscous mode for thread number %d\n", -1);
+        return -1;
+    }
+
+
     if (ifname) {
         struct ifreq ifr;
         snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", ifname);
@@ -147,11 +174,21 @@ static void do_block(rxring_t rx, struct tpacket_block_desc *desc)
 
     for (unsigned int i = 0; i < num_pkts; i++) {
         struct tpacket3_hdr *hdr = (struct tpacket3_hdr *) ptr;
-        printf("packet %u/%u %u.%u\n", i, num_pkts, hdr->tp_sec, hdr->tp_nsec);
+        printf("packet %u/%u %u.%u ", i, num_pkts, hdr->tp_sec, hdr->tp_nsec);
+
+        uint8_t *eth = ptr + hdr->tp_mac;
+        struct iphdr *iph = (struct iphdr *)(eth + ETH_HLEN);
+        if(iph->version == 4) {
+            struct in_addr src_addr, dst_addr;
+            src_addr.s_addr = iph->saddr;
+            dst_addr.s_addr = iph->daddr;
+            printf("ip_src %s, ", inet_ntoa(src_addr));
+            printf("ip_dst %s\n", inet_ntoa(dst_addr));
+        }
 
         /* packet */
-        if (rx->cb)
-            (*rx->cb)(rx->user, ptr + hdr->tp_mac, hdr->tp_snaplen);
+        // if (rx->cb)
+        //     (*rx->cb)(rx->user, ptr + hdr->tp_mac, hdr->tp_snaplen);
 
         ptr += hdr->tp_next_offset;
         //__sync_synchronize();
@@ -160,24 +197,56 @@ static void do_block(rxring_t rx, struct tpacket_block_desc *desc)
 
 void rxring_mainloop(rxring_t rx)
 {
+    struct tpacket_stats_v3 tp3_stats;
+
+    socklen_t tp3_len = sizeof(tp3_stats);
+    int err = getsockopt(rx->fd, SOL_PACKET, PACKET_STATISTICS, &tp3_stats, &tp3_len);
+    if(err){
+        perror("error: could not get packet statistics for the given socket\n");
+        return;
+    }
+
     struct pollfd pfd = {
         .fd = rx->fd,
         .events = POLLIN | POLLERR,
         .revents = 0,
     };
-    while (!rx->cancel) {
-        struct tpacket_block_desc *desc =
-            (struct tpacket_block_desc *) rx->map + rx->r_idx * rx->block_sz;
 
-        while (!(desc->hdr.bh1.block_status & TP_STATUS_USER))
-            poll(&pfd, 1, -1);
+    struct tpacket_block_desc **block_header = (struct tpacket_block_desc**)malloc(rx->nr_blocks * sizeof(struct tpacket_hdr_v1 *)); 
+    if(block_header == NULL){
+       fprintf(stderr, "error: cound not allocate block_header pointer array for thread %d\n", 0);
+    }
+
+   /* Storing the block_header pointer array in thread storage */
+    block_header = block_header;
+
+    for(unsigned int i = 0; i < rx->nr_blocks; ++i){
+        block_header[i] = (struct tpacket_block_desc *)(rx->map + (i * rx->block_sz));
+    }
+    
+    int cbh = 0, i, pstreak = 0;
+    while (!rx->cancel) {
+        int ret;
+        while (!(block_header[cbh]->hdr.bh1.block_status & TP_STATUS_USER)) {
+            ret = poll(&pfd, 1, -1);
+            if(ret > 0)
+                pstreak++;
+            if (pstreak > 2)
+                for(i = 0 ;i < rx->nr_blocks;i ++) {
+                    if(block_header[i]->hdr.bh1.block_status & TP_STATUS_USER) {
+                        cbh = i;
+                        break;
+                    }
+                }
+        }
+        pstreak = 0;
 
         /* walk block */
-        do_block(rx, desc);
+        do_block(rx, block_header[cbh]);
 
-        desc->hdr.bh1.block_status = TP_STATUS_KERNEL;
+        block_header[cbh]->hdr.bh1.block_status = TP_STATUS_KERNEL;
         __sync_synchronize();
-        rx->r_idx = (rx->r_idx + 1) % rx->nr_blocks;
+        cbh = (cbh + 1) % rx->nr_blocks;
     }
 }
 
@@ -191,7 +260,6 @@ void rxring_free(rxring_t rx)
     free(rx);
 }
 
-#include <ctype.h>
 static void hex_dumpf(FILE *f, const uint8_t *tmp, size_t len, size_t llen)
 {
     if (!f || 0 == len)
