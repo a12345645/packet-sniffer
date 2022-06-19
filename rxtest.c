@@ -1,4 +1,4 @@
-#include <linux/if.h>
+// #include <linux/if.h>
 #include <linux/if_ether.h> /* The L2 protocols */
 #include <linux/if_packet.h>
 #include <netinet/in.h>
@@ -15,6 +15,12 @@
 
 #include <netinet/ip.h>
 #include <arpa/inet.h>
+#include "time.h"
+
+#include <net/if.h>
+#include <netinet/ether.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
 
 typedef struct _rxring *rxring_t;
 typedef int (*rx_cb_t)(void *u, const uint8_t *buf, size_t len);
@@ -167,23 +173,76 @@ bool rxring_fanout_hash(rxring_t rx, uint16_t id)
     return !setsockopt(rx->fd, SOL_PACKET, PACKET_FANOUT, &val, sizeof(val));
 }
 
+void parse_udp_packet(struct iphdr *iph)
+{
+    struct udphdr *udph = (struct udphdr *)((uint8_t *)iph + (iph->ihl << 2));
+    
+    struct in_addr addr;
+    addr.s_addr = iph->saddr;
+    printf("ip_src %s.%d, ", inet_ntoa(addr), ntohs(udph->source));
+    addr.s_addr = iph->daddr;
+    printf("ip_dst %s.%d ", inet_ntoa(addr), ntohs(udph->dest));
+    printf("length %ld\n", ntohs(udph->len) - sizeof(struct udphdr));
+}
+//
+void parse_tcp_packet(struct iphdr *iph)
+{
+    struct tcphdr *tcph = (struct tcphdr *)((uint8_t *)iph + (iph->ihl << 2));
+
+    struct in_addr addr;
+    addr.s_addr = iph->saddr;
+    printf("ip_src %s.%d, ", inet_ntoa(addr), ntohs(tcph->source));
+    addr.s_addr = iph->daddr;
+    printf("ip_dst %s.%d ", inet_ntoa(addr), ntohs(tcph->dest));
+    printf("flag %d\n", tcph->th_flags);
+}
+
 static void do_block(rxring_t rx, struct tpacket_block_desc *desc)
 {
     const uint8_t *ptr = (uint8_t *) desc + desc->hdr.bh1.offset_to_first_pkt;
     unsigned int num_pkts = desc->hdr.bh1.num_pkts;
-
+    // printf("num_pkts %d\n", num_pkts);
     for (unsigned int i = 0; i < num_pkts; i++) {
         struct tpacket3_hdr *hdr = (struct tpacket3_hdr *) ptr;
-        printf("packet %u/%u %u.%u ", i, num_pkts, hdr->tp_sec, hdr->tp_nsec);
 
-        uint8_t *eth = ptr + hdr->tp_mac;
+        time_t pkttime = hdr->tp_sec;
+        struct tm *pkttm;
+        char buf[64];
+
+        pkttm = localtime(&pkttime);
+        strftime(buf, sizeof buf, "%Y-%m-%d %H:%M:%S", pkttm);
+
+        printf("%s.%09u ", buf, hdr->tp_nsec);
+
+        uint8_t *eth = (uint8_t *) ptr + hdr->tp_mac;
+
         struct iphdr *iph = (struct iphdr *)(eth + ETH_HLEN);
+
         if(iph->version == 4) {
-            struct in_addr src_addr, dst_addr;
-            src_addr.s_addr = iph->saddr;
-            dst_addr.s_addr = iph->daddr;
-            printf("ip_src %s, ", inet_ntoa(src_addr));
-            printf("ip_dst %s\n", inet_ntoa(dst_addr));
+            printf("IPv4 ");
+            switch (iph->protocol) {
+                case IPPROTO_UDP:
+                    printf("protocol UDP ");
+                    parse_udp_packet(iph);
+                    break;
+                case IPPROTO_TCP:
+                    printf("protocol TCP ");
+                    parse_tcp_packet(iph);
+                    break;
+                case IPPROTO_ICMP:
+                    printf("protocol ICMP ");
+                    struct in_addr src_addr, dst_addr;
+                    src_addr.s_addr = iph->saddr;
+                    dst_addr.s_addr = iph->daddr;
+                    printf("ip_src %s, ", inet_ntoa(src_addr));
+                    printf("ip_dst %s\n", inet_ntoa(dst_addr));
+                    break;
+                default:
+                    printf("protocol %d \n", iph->protocol);
+            }
+        }
+        else {
+            printf("other \n");
         }
 
         /* packet */
