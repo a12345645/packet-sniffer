@@ -184,19 +184,54 @@ void parse_udp_packet(struct iphdr *iph)
     printf("ip_dst %s.%d ", inet_ntoa(addr), ntohs(udph->dest));
     printf("length %ld\n", ntohs(udph->len) - sizeof(struct udphdr));
 }
-//
+
 void parse_tcp_packet(struct iphdr *iph)
 {
     struct tcphdr *tcph = (struct tcphdr *)((uint8_t *)iph + (iph->ihl << 2));
 
     struct in_addr addr;
     addr.s_addr = iph->saddr;
-    printf("ip_src %s.%d, ", inet_ntoa(addr), ntohs(tcph->source));
+    printf("%s.%d > ", inet_ntoa(addr), ntohs(tcph->source));
     addr.s_addr = iph->daddr;
-    printf("ip_dst %s.%d ", inet_ntoa(addr), ntohs(tcph->dest));
-    printf("flag %d\n", tcph->th_flags);
-}
+    printf("%s.%d ", inet_ntoa(addr), ntohs(tcph->dest));
 
+    char flag[7];
+    int fc = 0;
+    memset(flag, 0, 7);
+    if (tcph->syn) {
+        flag[fc] = 'S';
+        fc++;
+    }
+    if (tcph->ack) {
+        flag[fc] = 'A';
+        fc++;
+    }
+    if (tcph->fin) {
+        flag[fc] = 'F';
+        fc++;
+    }
+    if (tcph->rst) {
+        flag[fc] = 'R';
+        fc++;
+    }
+    if (tcph->psh) {
+        flag[fc] = 'P';
+        fc++;
+    }
+    if (tcph->urg) {
+        flag[fc] = 'U';
+        fc++;
+    }
+    uint16_t length = ntohs(iph->tot_len) - (tcph->doff * 4) - (iph->ihl * 4);
+
+    printf("flag [%s] ", flag);
+    printf("seq %u:%u ack %u ", ntohl(tcph->seq), ntohl(tcph->seq) + length, ntohl(tcph->ack_seq));
+
+    printf("window %d ", ntohs(tcph->window));
+
+    printf("length %d \n", length);
+    
+}
 static void do_block(rxring_t rx, struct tpacket_block_desc *desc)
 {
     const uint8_t *ptr = (uint8_t *) desc + desc->hdr.bh1.offset_to_first_pkt;
@@ -213,12 +248,12 @@ static void do_block(rxring_t rx, struct tpacket_block_desc *desc)
         strftime(buf, sizeof buf, "%Y-%m-%d %H:%M:%S", pkttm);
 
         printf("%s.%09u ", buf, hdr->tp_nsec);
-
+        
         uint8_t *eth = (uint8_t *) ptr + hdr->tp_mac;
 
         struct iphdr *iph = (struct iphdr *)(eth + ETH_HLEN);
 
-        if(iph->version == 4) {
+        if (iph->version == 4) {
             printf("IPv4 ");
             switch (iph->protocol) {
                 case IPPROTO_UDP:
@@ -241,8 +276,11 @@ static void do_block(rxring_t rx, struct tpacket_block_desc *desc)
                     printf("protocol %d \n", iph->protocol);
             }
         }
+        else if (iph->version == 6) {
+            printf("IPv6\n");
+        }
         else {
-            printf("other \n");
+            printf("other version %d\n", iph->version);
         }
 
         /* packet */
